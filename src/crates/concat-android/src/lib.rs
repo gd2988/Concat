@@ -614,21 +614,56 @@ mod log_file {
 mod awake {
     use slint::android::AndroidApp;
     use slint::android::android_activity::WindowManagerFlags;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
+    /// The flag asked for most recently, and whether a thread is already on
+    /// its way to apply it: holds and releases can come from any thread, and
+    /// coalescing keeps one thread on them rather than one per job.
+    static WANTED: Mutex<Option<bool>> = Mutex::new(None);
+    static APPLYING: AtomicBool = AtomicBool::new(false);
+
+    /// Applies the flag off the event loop's thread. `set_window_flags` takes
+    /// the backend's write lock, and the event loop holds that lock's read half
+    /// across the whole poll it dispatches input in (`AndroidApp::poll_events`),
+    /// so asking for the write from inside a tap on Export - which begins the
+    /// job whose `Awake` asks for this - deadlocked the window on the phone
+    /// itself: the tap never returned, and the system called it an ANR
+    /// (traces of 2026-11-13, `RwLock::write_contended` under
+    /// `awake::install`'s closure under `ExportPane::begin`).
     pub fn install(app: &AndroidApp) {
         let app = app.clone();
         concat::install_awake(Box::new(move |on| {
             log::debug!("display: the screen kept on while a job runs: {on}");
-            if on {
-                app.set_window_flags(
-                    WindowManagerFlags::KEEP_SCREEN_ON,
-                    WindowManagerFlags::empty(),
-                );
-            } else {
-                app.set_window_flags(
-                    WindowManagerFlags::empty(),
-                    WindowManagerFlags::KEEP_SCREEN_ON,
-                );
+            if let Ok(mut wanted) = WANTED.lock() {
+                *wanted = Some(on);
+            }
+            if APPLYING.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let app = app.clone();
+            let spawned = std::thread::Builder::new()
+                .name("display flags".into())
+                .spawn(move || loop {
+                    let wanted = WANTED.lock().ok().and_then(|mut wanted| wanted.take());
+                    let Some(on) = wanted else {
+                        APPLYING.store(false, Ordering::Release);
+                        return;
+                    };
+                    if on {
+                        app.set_window_flags(
+                            WindowManagerFlags::KEEP_SCREEN_ON,
+                            WindowManagerFlags::empty(),
+                        );
+                    } else {
+                        app.set_window_flags(
+                            WindowManagerFlags::empty(),
+                            WindowManagerFlags::KEEP_SCREEN_ON,
+                        );
+                    }
+                });
+            if spawned.is_err() {
+                APPLYING.store(false, Ordering::Release);
             }
         }));
     }
